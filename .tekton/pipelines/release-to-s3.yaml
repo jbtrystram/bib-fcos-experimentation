@@ -1,0 +1,198 @@
+# Tenant release pipeline for uploading FCOS builds to S3.
+#
+# Triggered automatically by the Konflux release service when
+# a Snapshot passes all required IntegrationTestScenarios.
+#
+# This pipeline:
+#   1. Extracts the OCI index pullspec from the Snapshot CR
+#   2. Runs `cosa import --download all` to pull the ostree container
+#      and all disk image artifacts from the OCI index
+#   3. Runs `cosa buildupload s3` to upload meta.json, builds.json,
+#      and all artifacts to the configured S3 bucket
+#
+# The pipeline mirrors the "Fetch Metadata" + "Fetch Artifacts" + "Publish"
+# stages from the upstream Jenkins release.Jenkinsfile:
+#   https://github.com/coreos/fedora-coreos-pipeline/blob/main/jobs/release.Jenkinsfile
+#
+# Prerequisites:
+#   - A Kubernetes secret "fcos-staging-aws-build-upload-config" in coreos-tenant
+#     containing an AWS config/credentials file.
+#   - The release-sa-fcc SA must have RBAC to read Snapshot CRs
+#     (managed in tenants-config: clusters/kflux-fedora-01/tenants/coreos-tenant/rbac.yaml).
+#   - The cosa image must include `cosa import --download` support
+#     (coreos/coreos-assembler#4591).
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: release-to-s3
+spec:
+  params:
+    - name: release
+      type: string
+      description: >
+        Namespaced name of the Release CR (injected by the release service).
+    - name: releasePlan
+      type: string
+      description: >
+        Namespaced name of the ReleasePlan CR (injected by the release service).
+    - name: snapshot
+      type: string
+      description: >
+        Namespaced name of the Snapshot CR (injected by the release service).
+    - name: COSA_IMAGE
+      type: string
+      default: "quay.io/redhat-user-workloads/coreos-tenant/coreos-assembler-main:on-pr-181ac62cf28a77169270c3d3567c336cd2d459cc"
+      description: >
+        coreos-assembler image with `cosa import --download` support.
+    - name: S3_BUCKET_AND_PREFIX
+      type: string
+      default: "fcos-builds/prod/streams/rawhide"
+      description: >
+        S3 bucket and path prefix for uploads (e.g. "bucket/prefix/streams/rawhide").
+        The pipeline appends "/builds" automatically.
+    - name: COMPONENT_NAME
+      type: string
+      default: "disk-images-rawhide"
+      description: >
+        Name of the component in the Snapshot whose containerImage to release.
+    - name: ACL
+      type: string
+      default: "private"
+      description: >
+        ACL for uploaded S3 objects (e.g. "private", "public-read").
+
+  tasks:
+    - name: import-and-upload-to-s3
+      taskSpec:
+        params:
+          - name: SNAPSHOT
+            type: string
+          - name: COMPONENT_NAME
+            type: string
+          - name: COSA_IMAGE
+            type: string
+          - name: S3_BUCKET_AND_PREFIX
+            type: string
+          - name: ACL
+            type: string
+        results:
+          - name: BUILD_VERSION
+            description: The FCOS build version that was uploaded.
+          - name: S3_DESTINATION
+            description: The full S3 path where the build was uploaded.
+        steps:
+          - name: release
+            image: $(params.COSA_IMAGE)
+            computeResources:
+              limits:
+                memory: 4Gi
+              requests:
+                cpu: 500m
+                memory: 2Gi
+            volumeMounts:
+              - name: aws-credentials
+                mountPath: /secrets/aws
+                readOnly: true
+            env:
+              - name: SNAPSHOT
+                value: $(params.SNAPSHOT)
+              - name: COMPONENT_NAME
+                value: $(params.COMPONENT_NAME)
+              - name: S3_BUCKET_AND_PREFIX
+                value: $(params.S3_BUCKET_AND_PREFIX)
+              - name: ACL
+                value: $(params.ACL)
+            workingDir: /srv
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+
+              echo "=== FCOS Release to S3 ==="
+              echo "SNAPSHOT: ${SNAPSHOT}"
+              echo "COMPONENT_NAME: ${COMPONENT_NAME}"
+              echo "S3_BUCKET_AND_PREFIX: ${S3_BUCKET_AND_PREFIX}"
+              echo "ACL: ${ACL}"
+
+              # ----------------------------------------------------------
+              # Step 1: Extract the OCI index pullspec from the Snapshot CR
+              # ----------------------------------------------------------
+              SNAPSHOT_NS="${SNAPSHOT%%/*}"
+              SNAPSHOT_NAME="${SNAPSHOT##*/}"
+
+              echo ""
+              echo "=== Fetching Snapshot ${SNAPSHOT_NAME} from ${SNAPSHOT_NS} ==="
+
+              SNAPSHOT_JSON=$(kubectl get snapshot "${SNAPSHOT_NAME}" \
+                -n "${SNAPSHOT_NS}" -o json)
+
+              SNAPSHOT_IMAGE=$(echo "${SNAPSHOT_JSON}" | jq -r \
+                --arg comp "${COMPONENT_NAME}" \
+                '.spec.components[] | select(.name == $comp) | .containerImage')
+
+              if [ -z "${SNAPSHOT_IMAGE}" ] || [ "${SNAPSHOT_IMAGE}" = "null" ]; then
+                echo "ERROR: Component '${COMPONENT_NAME}' not found in Snapshot '${SNAPSHOT_NAME}'"
+                echo "Available components:"
+                echo "${SNAPSHOT_JSON}" | jq -r '.spec.components[].name'
+                exit 1
+              fi
+
+              echo "Snapshot image: ${SNAPSHOT_IMAGE}"
+
+              # ----------------------------------------------------------
+              # Step 2: cosa import --download all
+              # ----------------------------------------------------------
+              # Set up a minimal cosa workdir structure.
+              # cosa import needs builds/ and tmp/ directories but does
+              # NOT require `cosa init`.
+              mkdir -p builds tmp tmp/repo
+
+              echo ""
+              echo "=== Running cosa import --download all ==="
+              cosa import "docker://${SNAPSHOT_IMAGE}" --download all --skip-prune
+
+              # ----------------------------------------------------------
+              # Step 3: Extract the build version
+              # ----------------------------------------------------------
+              VERSION=$(python3 -c "
+              import json
+              with open('builds/builds.json') as f:
+                  print(json.load(f)['builds'][0]['id'])
+              ")
+              echo ""
+              echo "=== Build version: ${VERSION} ==="
+
+              # List what we imported
+              echo "=== Build contents ==="
+              ls -lhR "builds/${VERSION}/" || true
+
+              # ----------------------------------------------------------
+              # Step 4: Upload to S3
+              # ----------------------------------------------------------
+              echo ""
+              echo "=== Running cosa buildupload s3 ==="
+              cosa buildupload --build="${VERSION}" \
+                s3 --aws-config-file=/secrets/aws/data \
+                --acl="${ACL}" \
+                "${S3_BUCKET_AND_PREFIX}/builds"
+
+              echo ""
+              echo "=== Upload complete ==="
+              echo "Build ${VERSION} uploaded to s3://${S3_BUCKET_AND_PREFIX}/builds/${VERSION}/"
+
+              echo -n "${VERSION}" > "$(results.BUILD_VERSION.path)"
+              echo -n "s3://${S3_BUCKET_AND_PREFIX}/builds/${VERSION}/" > "$(results.S3_DESTINATION.path)"
+        volumes:
+          - name: aws-credentials
+            secret:
+              secretName: fcos-staging-aws-build-upload-config
+      params:
+        - name: SNAPSHOT
+          value: $(params.snapshot)
+        - name: COMPONENT_NAME
+          value: $(params.COMPONENT_NAME)
+        - name: COSA_IMAGE
+          value: $(params.COSA_IMAGE)
+        - name: S3_BUCKET_AND_PREFIX
+          value: $(params.S3_BUCKET_AND_PREFIX)
+        - name: ACL
+          value: $(params.ACL)
