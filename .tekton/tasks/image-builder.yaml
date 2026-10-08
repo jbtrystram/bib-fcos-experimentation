@@ -406,16 +406,18 @@ spec:
         echo "CONFIG_GIT_URL: ${CONFIG_GIT_URL}"
         echo "CONFIG_GIT_REF: ${CONFIG_GIT_REF}"
 
-        # Build annotation flags for oras push (only include non-empty labels)
-        ORAS_ANNOTATIONS=()
+        # Build annotation flags for `buildah manifest add --artifact`
+        # (only include non-empty labels). --artifact-annotation sets the
+        # annotation directly on the created artifact manifest.
+        ARTIFACT_ANNOTATIONS=()
         if [ -n "${CONFIG_COMMIT}" ]; then
-          ORAS_ANNOTATIONS+=(--annotation "vcs-ref=${CONFIG_COMMIT}")
+          ARTIFACT_ANNOTATIONS+=(--artifact-annotation "vcs-ref=${CONFIG_COMMIT}")
         fi
         if [ -n "${CONFIG_GIT_URL}" ]; then
-          ORAS_ANNOTATIONS+=(--annotation "org.opencontainers.image.source=${CONFIG_GIT_URL}")
+          ARTIFACT_ANNOTATIONS+=(--artifact-annotation "org.opencontainers.image.source=${CONFIG_GIT_URL}")
         fi
         if [ -n "${CONFIG_GIT_REF}" ]; then
-          ORAS_ANNOTATIONS+=(--annotation "com.coreos.stream=${CONFIG_GIT_REF}")
+          ARTIFACT_ANNOTATIONS+=(--artifact-annotation "com.coreos.stream=${CONFIG_GIT_REF}")
         fi
 
         # create the output dir (clean any leftovers from a previous run)
@@ -530,27 +532,38 @@ spec:
             continue
           fi
 
-          # Push artifact with oras. The disk image variant is identified by
-          # --artifact-type, and the real architecture is identified by
-          # --artifact-platform (oras generates the OCI config JSON for us).
+          # Push artifact with buildah. The disk image variant is identified
+          # by --artifact-type, and the real architecture is recorded via
+          # --arch so the final OCI index keeps a correct platform.
           ARTIFACT_TAG="${OUTPUT_IMAGE}-${artifact}"
           echo "=== Pushing ${artifact} to ${ARTIFACT_TAG} (artifact-type ${MEDIA_TYPE}, platform linux/${OCI_ARCH}) ==="
 
-          # Get just the filename for oras
+          # Get just the filename for buildah
           DISK_FILENAME=$(basename "${DISK_FILE}")
 
-          if ! sudo podman run --rm \
-            -v "${OUTPUT_DIR}:/output:Z" \
-            -v "${BUILD_DIR}/.docker:/root/.docker:Z" \
-            -w "/output" \
-            "${ORAS_IMAGE}" \
-            push \
-            --registry-config /root/.docker/config.json \
-            --artifact-type "${MEDIA_TYPE}" \
-            --artifact-platform "linux/${OCI_ARCH}" \
-            "${ORAS_ANNOTATIONS[@]}" \
-            "${ARTIFACT_TAG}" \
-            "${DISK_FILENAME}"; then
+          # We create an empty manifest list from scratch. Remove any
+          # leftover list with the same name first (e.g. from a previous
+          # run on this persistent VM) so stale entries don't linger.
+          buildah manifest rm "${ARTIFACT_TAG}" >/dev/null 2>&1 || true
+          if ! buildah manifest create "${ARTIFACT_TAG}"; then
+            echo "ERROR: Failed to create manifest list for ${artifact}"
+            BUILD_REPORT=$(echo "$BUILD_REPORT" | jq -c ".failed += [\"$artifact\"]")
+            continue
+          fi
+
+          if ! buildah manifest add --arch "${OCI_ARCH}" --os linux \
+              --artifact --artifact-type "${MEDIA_TYPE}" \
+              "${ARTIFACT_ANNOTATIONS[@]}" \
+              "${ARTIFACT_TAG}" \
+              "${OUTPUT_DIR}/${DISK_FILENAME}"; then
+
+            echo "ERROR: Failed to add ${artifact} artifact to manifest list"
+            BUILD_REPORT=$(echo "$BUILD_REPORT" | jq -c ".failed += [\"$artifact\"]")
+            continue
+          fi
+
+          if ! buildah manifest push --authfile "${BUILD_DIR}/.docker/config.json" \
+              --all "${ARTIFACT_TAG}"; then
 
             echo "ERROR: Failed to push ${artifact}"
             BUILD_REPORT=$(echo "$BUILD_REPORT" | jq -c ".failed += [\"$artifact\"]")
