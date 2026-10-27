@@ -1,0 +1,14 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Bump image-builder-cli and builder-image digests in image-builder-config.yaml",
+      "managerFilePatterns": ["/^image-builder-config\\.yaml$/"],
+      "matchStrings": [
+        "(?:image-builder-cli|builder-image):\\s*\"(?<depName>[^@\"]+)@(?<currentDigest>sha256:[0-9a-f]+)\""
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ]
+}
