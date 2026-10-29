@@ -116,7 +116,7 @@ spec:
       - name: SOURCE_IMAGE
         value: $(params.source-image)
       - name: OUTPUT_IMAGE
-        value: $(params.output-image)-linux-amd64
+        value: $(params.output-image)
       - name: OUTPUT_NAME
         value: $(params.output-name)
       - name: SOURCE_ARTIFACT
